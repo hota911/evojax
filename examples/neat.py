@@ -9,7 +9,6 @@ import jax.numpy as jnp
 
 from evojax.task.slimevolley import SlimeVolley
 from evojax.trainer import Trainer
-from evojax.util import get_params_format_fn
 
 
 # Data classes for the NEAT algorithm.
@@ -115,25 +114,36 @@ def create_empty_genome_fn(config: Config) -> Genome:
     )
 
 
-# def get_params_format_fn(config: Config):
-#     """Generate the number of parameters and format function.
+def get_params_format_fn(config: Config):
+    """Generate the number of parameters and format function for the genome.
 
-#     Parameters of NetworkPolicy must be Array and cannot be Pytree.
-#     Hence, we need to flatten the Pytree to Array.
-#     """
-#     init_params = create_empty_genome_fn(config)
-#     flat, tree = jax.tree.flatten(init_params)
-#     params_sizes = np.cumsum([np.prod(p.shape) for p in flat])
+    Parameters of NetworkPolicy must be Array and cannot be Pytree.
+    Hence, we need to flatten the Pytree to Array.
+    """
+    init_params = create_empty_genome_fn(config)
+    flat, tree = jax.tree.flatten(init_params)
 
-#     def params_format_fn(params: jnp.ndarray) -> Genome:
-#         params = jax.tree.map(
-#             lambda x, y: x.reshape(y.shape),
-#             jnp.split(params, params_sizes, axis=-1)[:-1],
-#             flat,
-#         )
-#         return jax.tree.unflatten(tree, params)
+    # calculate the indexes to split the parameters.
+    params_sizes = np.cumsum([np.prod(p.shape) for p in flat])[0:-1]
+    info = [p.dtype for p in flat]
+    print(info)
+    print(params_sizes)
 
-#     return params_sizes[-1], params_format_fn
+    def params_format_fn(params: jnp.ndarray) -> Genome:
+        # We use loop here.
+        # TODO: Check the performance of this function (e.g. jax.lax.map)
+        print(params.shape)
+        parts = jnp.split(params, params_sizes)
+        leaves = [jnp.asarray(p, dtype=d) for p, d in zip(parts, info)]
+
+        return jax.tree.unflatten(tree, leaves)
+
+    return params_sizes[-1], params_format_fn
+
+
+def convert_to_array_fn(genome: Genome):
+    """Convert the genome as a flat array."""
+    return jnp.concatenate(jax.tree.leaves(genome), dtype=jnp.float32)
 
 
 ##############################################################
@@ -194,13 +204,14 @@ class NEATPolicy(PolicyNetwork):
         self._forward_with_config_fn = jax.jit(forward_with_config_fn)
 
         # Get the number of parameters
-        # self.num_params, format_params_fn = get_params_format_fn(config)
-        # self._format_params = jax.jit(jax.vmap(format_params_fn))
+        self.num_params, format_params_fn = get_params_format_fn(config)
+        self._format_params = jax.jit(jax.vmap(format_params_fn))
 
     def get_actions(
-        self, t_states, params: Genome, p_states: PolicyState
+        self, t_states, params: jax.Array, p_states: PolicyState
     ) -> tuple[jax.Array, PolicyState]:
-        # params = self._format_params(params)
+        print(params.shape)
+        params = self._format_params(params)
         return self._forward_with_config_fn(t_states, params), p_states
 
 
@@ -218,13 +229,21 @@ class NEATConfig:
     pop_size: int
 
 
-def ask_fn(neat_config: NEATConfig):
-    """Generate a new population."""
+def ask_fn(neat_config: NEATConfig) -> jax.Array:
+    """Generate a new population.
+
+    Returns:
+        vmapped Genome.
+    """
 
     # For now create an empty genome.
     genome = create_empty_genome_fn(neat_config.config)
+    convert_to_array = jax.jit(jax.vmap(convert_to_array_fn))
+
     # Repeat the genome for the population size.
-    return jax.tree.map(lambda x: jnp.tile(x, (neat_config.pop_size, 1)), genome)
+    return convert_to_array(
+        jax.tree.map(lambda x: jnp.tile(x, (neat_config.pop_size, 1)), genome)
+    )
 
 
 def tell_fn(fitness):
@@ -299,7 +318,9 @@ def test1():
     policy = NEATPolicy(config)
     p_state = policy.reset(t_state)
     get_actions = jax.jit(jax.vmap(policy.get_actions))
-    output, p_state = get_actions(x, genome, p_state)
+    convert_to_array = jax.jit(jax.vmap(convert_to_array_fn))
+    params = convert_to_array(genome)
+    output, p_state = get_actions(x, params, p_state)
     output.block_until_ready()
 
     assert output.shape == (1, 1)
