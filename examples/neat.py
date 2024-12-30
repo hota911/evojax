@@ -243,9 +243,14 @@ def ask_fn(neat_config: NEATConfig):
     # Repeat the genome for the population size.
     return jax.tree.map(lambda x: jnp.tile(x, (neat_config.pop_size, 1)), genome)
 
+# Type alias for the genome population.
+# To make it easier to understand the genome is only a single genome or a population of genomes.
+GenomePopulation = Genome
 
-def tell_fn(fitness):
-    return None
+
+def tell_fn(fitness: jax.typing.ArrayLike, pops: GenomePopulation) -> Genome:
+    maxi = jax.lax.argmax(fitness, 0, jnp.int32)
+    return jax.tree.map(lambda leaf: leaf[maxi], pops)
 
 
 class NEAT(NEAlgorithm):
@@ -258,14 +263,12 @@ class NEAT(NEAlgorithm):
         self._tell = jax.jit(tell_fn)
 
     def ask(self):
-        self._params = self._ask(self._config)
-        return self._params
+        self._pops = self._ask(self._config)
+        return self._pops
 
     def tell(self, fitness: jax.typing.ArrayLike):
-        maxi = jax.lax.argmax(fitness, 0, jnp.int32)
-
         # Select the best parameters.
-        self._best_params = jax.tree.map(lambda leaf: leaf[maxi], self._params)
+        self._best_params = self._tell(fitness, self._pops)
 
     @property
     def best_params(self):
