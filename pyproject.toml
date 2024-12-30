@@ -1,0 +1,33 @@
+[project]
+name = "evojax"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "flax",
+  # Upgrade flax dependency after migrating RNN (a change introduced in 0.7.0):
+  # https://flax.readthedocs.io/en/latest/guides/rnncell_upgrade_guide.html
+  "jax>=0.2.17",
+  "jaxlib>=0.1.65",
+  "Pillow",
+  "cma",
+  "matplotlib",
+  "pyyaml",
+  "opencv-python>=4.10.0.84",
+  "ipykernel>=6.29.5",
+  "ruff>=0.8.4",
+]
+dynamic = ["license", "authors", "classifiers", "optional-dependencies"]
+
+[tool.uv.sources]
+evojax = { path = "evojax" }
+
+
+[tool.pytest.ini_options]
+addopts = [
+    "--import-mode=importlib",
+]
+pythonpath = [
+  "."
+]
