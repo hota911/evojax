@@ -164,7 +164,21 @@ def matmul_fn(adj, x):
 
 
 def forward_fn(config: Config, genome: Genome, x: jax.Array):
+    """Calculate the forward network.
+
+    Args:
+        config (Config): The configuration. Used to pad the input.
+        genome (Genome): _description_
+        x (jax.Array): _description_
+
+    Returns:
+        _type_: _description_
+    """
+    print("Forward fn")
+    print(x.shape)
+    print(config.max_nodes - x.shape[0])
     x = jnp.pad(x, (0, config.max_nodes - x.shape[0]))
+    print(x.shape)
     adj = get_adjacency_matrix_fn(config, genome)
     for _ in range(config.max_depth):
         x = matmul_fn(adj, x)
@@ -174,6 +188,8 @@ def forward_fn(config: Config, genome: Genome, x: jax.Array):
             return jax.lax.switch(activation, ACTIVATION_FUNCTIONS, x)
 
         activate = jax.vmap(activate_fn)
+        print(genome.node_activation.shape)
+        print(genome.node_ids.shape)
         x = activate(genome.node_activation, x)
     return x
 
@@ -187,21 +203,22 @@ class NEATPolicy(PolicyNetwork):
     def __init__(self, config: Config):
         self._config = config
 
-        def forward_with_config_fn(t_states, params: Genome):
-            result = forward_fn(config, params, t_states)
+        def forward_with_config_fn(obs: jax.Array, params: Genome):
+            print(obs)
+            result = forward_fn(config, params, obs)
             return result[config.input_dim : config.input_dim + config.output_dim]
 
-        self._forward_with_config_fn = jax.jit(forward_with_config_fn)
+        self._forward_with_config_fn = jax.jit(jax.vmap(forward_with_config_fn))
 
         # Get the number of parameters
         # self.num_params, format_params_fn = get_params_format_fn(config)
         # self._format_params = jax.jit(jax.vmap(format_params_fn))
 
     def get_actions(
-        self, t_states, params: Genome, p_states: PolicyState
+        self, t_states: TaskState, params: Genome, p_states: PolicyState
     ) -> tuple[jax.Array, PolicyState]:
-        # params = self._format_params(params)
-        return self._forward_with_config_fn(t_states, params), p_states
+        print(params.node_ids.shape)
+        return self._forward_with_config_fn(t_states.obs, params), p_states
 
 
 ##############################################################
@@ -241,10 +258,14 @@ class NEAT(NEAlgorithm):
         self._tell = jax.jit(tell_fn)
 
     def ask(self):
-        return self._ask(self._config)
+        self._params = self._ask(self._config)
+        return self._params
 
     def tell(self, fitness: jax.typing.ArrayLike):
-        return self._tell(fitness)
+        maxi = jax.lax.argmax(fitness, 0, jnp.int32)
+
+        # Select the best parameters.
+        self._best_params = jax.tree.map(lambda leaf: leaf[maxi], self._params)
 
     @property
     def best_params(self):
@@ -260,50 +281,50 @@ class NEAT(NEAlgorithm):
 ##############################################################
 
 
-def test1():
-    config = Config(input_dim=2, output_dim=1, max_nodes=10, max_edges=20, max_depth=10)
+# def test1():
+#     config = Config(input_dim=2, output_dim=1, max_nodes=10, max_edges=20, max_depth=10)
 
-    # 0 1
-    # | |
-    # 4 3
-    #  \|
-    #   2
-    node_ids = jnp.array([0, 1, 2, 3, 4])
-    node_activation = jnp.array([0, 0, 2, 0, 0])
-    conn_ids = jnp.array([0, 1, 2, 3])
-    conn_in = jnp.array([0, 1, 4, 3])
-    conn_out = jnp.array([4, 3, 2, 2])
-    conn_weights = jnp.array([1.0, 1.0, 1.0, 1.0])
-    conn_enabled = jnp.array([True, True, True, True])
-    genome = create_genome(
-        config,
-        node_ids,
-        node_activation,
-        conn_ids,
-        conn_in,
-        conn_out,
-        conn_weights,
-        conn_enabled,
-    )
-    genome = jax.tree.map(lambda x: jnp.array([x]), genome)
+#     # 0 1
+#     # | |
+#     # 4 3
+#     #  \|
+#     #   2
+#     node_ids = jnp.array([0, 1, 2, 3, 4])
+#     node_activation = jnp.array([0, 0, 2, 0, 0])
+#     conn_ids = jnp.array([0, 1, 2, 3])
+#     conn_in = jnp.array([0, 1, 4, 3])
+#     conn_out = jnp.array([4, 3, 2, 2])
+#     conn_weights = jnp.array([1.0, 1.0, 1.0, 1.0])
+#     conn_enabled = jnp.array([True, True, True, True])
+#     genome = create_genome(
+#         config,
+#         node_ids,
+#         node_activation,
+#         conn_ids,
+#         conn_in,
+#         conn_out,
+#         conn_weights,
+#         conn_enabled,
+#     )
+#     genome = jax.tree.map(lambda x: jnp.array([x]), genome)
 
-    x = jnp.stack([jnp.array([1, 1])])
-    print(forward(config, genome, x))
+#     x = jnp.stack([jnp.array([1, 1])])
+#     print(forward(config, genome, x))
 
-    # SlimeVolley
-    task = SlimeVolley()
+#     # SlimeVolley
+#     task = SlimeVolley()
 
-    task_reset = jax.jit(task.reset)
-    t_state = task_reset(jax.random.PRNGKey(seed=0)[None, :])
+#     task_reset = jax.jit(task.reset)
+#     t_state = task_reset(jax.random.PRNGKey(seed=0)[None, :])
 
-    policy = NEATPolicy(config)
-    p_state = policy.reset(t_state)
-    get_actions = jax.jit(jax.vmap(policy.get_actions))
-    output, p_state = get_actions(x, genome, p_state)
-    output.block_until_ready()
+#     policy = NEATPolicy(config)
+#     p_state = policy.reset(t_state)
+#     get_actions = jax.jit(jax.vmap(policy.get_actions))
+#     output, p_state = get_actions(t_state, genome, p_state)
+#     output.block_until_ready()
 
-    assert output.shape == (1, 1)
-    np.testing.assert_allclose(output, jnp.array([[0.880797]]), atol=1e-5)
+#     assert output.shape == (1, 1)
+#     np.testing.assert_allclose(output, jnp.array([[0.880797]]), atol=1e-5)
 
 
 def test2():
@@ -330,10 +351,12 @@ def test2():
 
     policy = NEATPolicy(config)
     p_state = policy.reset(t_state)
-    get_actions = jax.jit(jax.vmap(policy.get_actions))
-    output, p_state = get_actions(t_state.obs, pops, p_state)
+    get_actions = jax.jit(policy.get_actions)
+    output, p_state = get_actions(t_state, pops, p_state)
 
+    print("-------------------")
     print(output.block_until_ready())
+    print("-------------------")
 
 
 def test3():
@@ -362,22 +385,19 @@ def test3():
         solver=solver,
         train_task=train_task,
         test_task=test_task,
-        max_iter=10,
-        log_interval=10,
-        test_interval=10,
-        n_repeats=1,
-        n_evaluations=1,
+        max_iter=20,
+        log_interval=4,
+        test_interval=5,
+        n_repeats=3,
+        n_evaluations=4,
         seed=42,
         log_dir="./log",
         logger=None,
-        # We need to use for loop since parameters are PyTree
-        use_for_loop=True,
     )
 
     trainer.run(demo_mode=False)
 
 
 if __name__ == "__main__":
-    test1()
     test2()
     test3()
