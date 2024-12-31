@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import dataclasses
+from datetime import datetime
 from functools import partial
 import math
 import os
@@ -753,7 +754,7 @@ class NEAT(NEAlgorithm):
 #     np.testing.assert_allclose(output, jnp.array([[0.880797]]), atol=1e-5)
 
 
-log_dir = "./log/slimevolley"
+log_dir = f"./log/slimevolley_{datetime.now().strftime("%Y%m%d-%H%M%S")}"
 logger = util.create_logger(name="SlimeVolley", log_dir=log_dir, debug=False)
 
 
@@ -770,7 +771,7 @@ def test3():
         max_edges=200,
         max_depth=10,
     )
-    neat_config = NEATConfig(config, pop_size=1000)
+    neat_config = NEATConfig(config, pop_size=100)
     policy = NEATPolicy(config)
     solver = NEAT(neat_config)
 
@@ -783,7 +784,7 @@ def test3():
         solver=solver,
         train_task=train_task,
         test_task=test_task,
-        max_iter=100,
+        max_iter=300,
         log_interval=1,
         test_interval=10,
         n_repeats=1,
