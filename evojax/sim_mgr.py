@@ -81,26 +81,7 @@ def duplicate_params(params: jnp.ndarray,
     if ma_training:
         return jnp.tile(params, (repeats, ) + (1,) * (params.ndim - 1))
     else:
-        if isinstance(params, jax.typing.ArrayLike):  # type: ignore
-            return jnp.repeat(params, repeats=repeats, axis=0)
-        else:
-            return jax.tree.map(
-                lambda x: jnp.repeat(x, repeats=repeats, axis=0), params
-            )
-
-
-def get_size(params) -> int:
-    if isinstance(params, jax.typing.ArrayLike):  # type: ignore
-        return params.shape[0]
-    else:
-        return jax.tree_leaves(params)[0].shape[0]
-
-
-def add_dimension(params):
-    if isinstance(params, jax.typing.ArrayLike):  # type: ignore
-        return params[None, :]
-    else:
-        return jax.tree_map(lambda x: x[None, :], params)
+        return jnp.repeat(params, repeats=repeats, axis=0)
 
 
 @jax.jit
@@ -214,8 +195,8 @@ class SimManager(object):
 
         def rollout(task_states, policy_states, params, obs_params,
                     step_once_fn, max_steps):
-            accumulated_rewards = jnp.zeros(get_size(params))
-            valid_masks = jnp.ones(get_size(params))
+            accumulated_rewards = jnp.zeros(params.shape[0])
+            valid_masks = jnp.ones(params.shape[0])
             ((task_states, policy_states, params, obs_params,
               accumulated_rewards, valid_masks),
              (obs_set, obs_mask)) = jax.lax.scan(
@@ -287,7 +268,8 @@ class SimManager(object):
             task_reset_func = self._valid_reset_fn
             task_step_func = self._valid_step_fn
             task_max_steps = self._valid_max_steps
-            params = duplicate_params(add_dimension(params), self._n_evaluations, False)
+            params = duplicate_params(
+                params[None, :], self._n_evaluations, False)
         else:
             n_repeats = self._n_repeats
             task_reset_func = self._train_reset_fn
@@ -302,8 +284,8 @@ class SimManager(object):
             self._ma_training)
         task_state = task_reset_func(reset_keys)
         policy_state = policy_reset_func(task_state)
-        scores = jnp.zeros(get_size(params))
-        valid_mask = jnp.ones(get_size(params))
+        scores = jnp.zeros(params.shape[0])
+        valid_mask = jnp.ones(params.shape[0])
         start_time = time.perf_counter()
         rollout_steps = 0
         sim_steps = 0
@@ -333,7 +315,8 @@ class SimManager(object):
             n_repeats = self._test_n_repeats
             task_reset_func = self._valid_reset_fn
             rollout_func = self._valid_rollout_fn
-            params = duplicate_params(add_dimension(params), self._n_evaluations, False)
+            params = duplicate_params(
+                params[None, :], self._n_evaluations, False)
         else:
             n_repeats = self._n_repeats
             task_reset_func = self._train_reset_fn
