@@ -106,7 +106,7 @@ def create_empty_genome_fn(config: Config) -> Genome:
         config.input_dim,
     )
     conn_weights = jnp.ones(conns)
-    conn_enabled = jnp.ones(conns, dtype=bool)
+    conn_enabled = jnp.zeros(conns, dtype=bool)
 
     return create_genome(
         config,
@@ -118,6 +118,70 @@ def create_empty_genome_fn(config: Config) -> Genome:
         conn_weights,
         conn_enabled,
     )
+
+
+def genome_to_mermaid(genome: Genome, config: Config, show_disabled: bool) -> str:
+    """Convert genome to mermaid graph definition."""
+    mermaid = [
+        "graph TD;",
+    ]
+
+    # Add nodes with styling
+    def node_type(node_id):
+        if node_id < config.input_dim:
+            return "i"
+        elif node_id < config.input_dim + config.output_dim:
+            return "o"
+        else:
+            return "h"
+
+    for node_id in genome.node_ids:
+        if node_id >= 0:
+            type = node_type(node_id)
+            if node_id == 0:
+                mermaid.append("    subgraph Input")
+            elif node_id == config.input_dim:
+                mermaid.append("    end")
+                mermaid.append("    subgraph Output")
+            elif node_id == config.input_dim + config.output_dim:
+                mermaid.append("    end")
+                mermaid.append("    subgraph Hidden")
+            if type == "i":
+                mermaid.append(f'    {type}{node_id}(["Input {node_id}"]):::input')
+            elif type == "o":
+                mermaid.append(f'    {type}{node_id}(["Output {node_id}"]):::output')
+            else:
+                mermaid.append(
+                    f'    {type}{node_id}(["Hidden {node_id}"]):::hidden_node'
+                )
+    mermaid.append("    end")
+
+    # Add connections
+    for id, src, dst, w, enabled in zip(
+        genome.conn_ids,
+        genome.conn_in,
+        genome.conn_out,
+        genome.conn_weights,
+        genome.conn_enabled,
+    ):
+        if id >= 0 and (show_disabled or enabled):
+            src_prefix = node_type(src)
+            dst_prefix = node_type(dst)
+            weight = f"{w:.2f}"
+            arrow = "-->" if enabled else "-.->"
+            mermaid.append(f"    {src_prefix}{src} {arrow}|{weight}| {dst_prefix}{dst}")
+
+    # Add styles
+    mermaid.extend(
+        [
+            "    classDef input fill:#61DAFB,stroke:#333,stroke-width:2px;",
+            "    classDef output fill:#4EC9B0,stroke:#333,stroke-width:2px;",
+            "    classDef hidden_node fill:#9CA3AF,stroke:#333,stroke-width:2px;",
+            "    linkStyle default stroke:#E5E7EB,stroke-width:2px;",
+        ]
+    )
+
+    return "\n".join(mermaid)
 
 
 # def get_params_format_fn(config: Config):
@@ -179,11 +243,7 @@ def forward_fn(config: Config, genome: Genome, x: jax.Array):
     Returns:
         _type_: _description_
     """
-    print("Forward fn")
-    print(x.shape)
-    print(config.max_nodes - x.shape[0])
     x = jnp.pad(x, (0, config.max_nodes - x.shape[0]))
-    print(x.shape)
     adj = get_adjacency_matrix_fn(config, genome)
     for _ in range(config.max_depth):
         x = matmul_fn(adj, x)
@@ -193,8 +253,6 @@ def forward_fn(config: Config, genome: Genome, x: jax.Array):
             return jax.lax.switch(activation, ACTIVATION_FUNCTIONS, x)
 
         activate = jax.vmap(activate_fn)
-        print(genome.node_activation.shape)
-        print(genome.node_ids.shape)
         x = activate(genome.node_activation, x)
     return x
 
@@ -209,7 +267,6 @@ class NEATPolicy(PolicyNetwork):
         self._config = config
 
         def forward_with_config_fn(obs: jax.Array, params: Genome):
-            print(obs)
             result = forward_fn(config, params, obs)
             return result[config.input_dim : config.input_dim + config.output_dim]
 
@@ -222,7 +279,6 @@ class NEATPolicy(PolicyNetwork):
     def get_actions(
         self, t_states: TaskState, params: Genome, p_states: PolicyState
     ) -> tuple[jax.Array, PolicyState]:
-        print(params.node_ids.shape)
         return self._forward_with_config_fn(t_states.obs, params), p_states
 
 
@@ -258,33 +314,9 @@ class NEATConfig:
     prob_update_conn_weights: float = 0.1
     prob_update_conn_enabled: float = 0.1
 
-
-def ask_fn(neat_config: NEATConfig):
-    """Generate a new population."""
-
-    # For now create an empty genome.
-    genome = create_empty_genome_fn(neat_config.config)
-    # Repeat the genome for the population size.
-    return jax.tree.map(lambda x: jnp.tile(x, (neat_config.pop_size, 1)), genome)
-
-
-# Type alias for the genome population.
-# To make it easier to understand the genome is only a single genome or a population of genomes.
-GenomePopulation = Genome
-
-
-def tell_fn(fitness: jax.typing.ArrayLike, pops: GenomePopulation) -> Genome:
-    maxi = jax.lax.argmax(fitness, 0, jnp.int32)
-    best_params = jax.tree.map(lambda leaf: leaf[maxi], pops)
-
-    # Calculate next generation.
-
-    return best_params
-
-
 @jax.jit
 def pick_one(key: jax.Array, mask: jax.Array) -> int:
-    """Pick up one index where the mask is truefp.
+    """Pick up one index where the mask is true.
 
     Args:
         mask (jax.Array): The mask. 1-d array of bool.
@@ -297,6 +329,11 @@ def pick_one(key: jax.Array, mask: jax.Array) -> int:
     # Pick up one index from the filtered indices.
     chosen = jax.random.randint(key, (1,), 0, mask.sum())
     return filtered[chosen][0]  # type: ignore
+
+
+def select(cond: jax.Array, genome_true: Genome, genome_false: Genome) -> Genome:
+    """Select the genome based on the condition."""
+    return jax.tree.map(lambda x, y: jnp.where(cond, x, y), genome_true, genome_false)
 
 
 # @partial(jax.jit, static_argnums=(0,))
@@ -363,26 +400,18 @@ def mutate_add_node(
     conn_enabled = conn_enabled.at[new_edge_idx].set(jnp.array([True, True]))
 
     return (
-        Genome(
-            node_ids=jnp.where(
-                new_node_id >= config.max_nodes, genome.node_ids, node_ids
+        select(
+            new_node_id < config.max_nodes,
+            Genome(
+                node_ids=node_ids,
+                node_activation=node_activation,
+                conn_ids=conn_ids,
+                conn_in=conn_in,
+                conn_out=conn_out,
+                conn_weights=conn_weights,
+                conn_enabled=conn_enabled,
             ),
-            node_activation=jnp.where(
-                new_node_id >= config.max_nodes, genome.node_activation, node_activation
-            ),
-            conn_ids=jnp.where(
-                new_node_id >= config.max_nodes, genome.conn_ids, conn_ids
-            ),
-            conn_in=jnp.where(new_node_id >= config.max_nodes, genome.conn_in, conn_in),
-            conn_out=jnp.where(
-                new_node_id >= config.max_nodes, genome.conn_out, conn_out
-            ),
-            conn_weights=jnp.where(
-                new_node_id >= config.max_nodes, genome.conn_weights, conn_weights
-            ),
-            conn_enabled=jnp.where(
-                new_node_id >= config.max_nodes, genome.conn_enabled, conn_enabled
-            ),
+            genome,
         ),
         next_edge_id + 2,
     )
@@ -407,8 +436,6 @@ def mutate_add_connection(
     # output or hidden
     dst = pick_one(key_dst, genome.node_ids >= config.input_dim)
 
-    jax.debug.print("src: {}, dst: {}", src, dst)
-
     # New graph
     new_edge_idx = jnp.count_nonzero(genome.conn_ids >= 0)
     conn_ids = genome.conn_ids.at[new_edge_idx].set(next_edge_id)
@@ -428,11 +455,8 @@ def mutate_add_connection(
             jnp.any(jnp.logical_and(genome.conn_in == src, genome.conn_out == dst))
         ),
     )
-    jax.debug.print("valid: {}", valid)
-    jax.debug.print("depth: {}", calculate_depth(config, conn_in, conn_out))
     # - there is no cycle
     valid = jnp.logical_and(valid, calculate_depth(config, conn_in, conn_out) != -1)
-    jax.debug.print("valid: {}", valid)
 
     return (
         Genome(
@@ -560,7 +584,6 @@ def mutate_genome(
             2,
         ),
     )
-    jax.debug.print("p: {}, index: {}", p, index)
 
     branches = [
         lambda: mutate_add_node(neat_config.config, genome, key_mutate, next_edge_id),
@@ -577,8 +600,16 @@ def mutate_genome(
     return (genome, new_edge_id)
 
 
+# Type alias for the genome population.
+# To make it easier to understand the genome is only a single genome or a population of genomes.
+GenomePopulation = Genome
+
+
 def generate_new_population_fn(
-    neat_config: NEATConfig, fitness: jax.typing.ArrayLike, pop: GenomePopulation
+    neat_config: NEATConfig,
+    fitness: jax.typing.ArrayLike,
+    pop: GenomePopulation,
+    key: jax.Array,
 ) -> GenomePopulation:
     """Generate a new population."""
     # Calculate the best genomes.
@@ -588,30 +619,79 @@ def generate_new_population_fn(
 
     # Repeat the top genomes.
     n_repeats = (neat_config.pop_size + k - 1) // k
-    return jax.tree_map(
+    pop = jax.tree_map(
         lambda x: jnp.repeat(
             x, n_repeats, axis=0, total_repeat_length=neat_config.pop_size
         ),
         top_genomes,
     )
 
+    new_edge_id = jnp.max(pop.conn_ids) + 1
+
+    keys = jax.random.split(key, neat_config.pop_size)
+
+    # Mutate the genes. To assign the edge id sequentially, we use scan.
+    def mutate(
+        carry: tuple[int, jax.Array], genome: Genome
+    ) -> tuple[tuple[int, jax.Array], Genome]:
+        (i, new_edge_id) = carry
+        (genome, new_edge_id) = mutate_genome(neat_config, genome, keys[i], new_edge_id)
+        return ((i + 1, new_edge_id), genome)
+
+    _, pop = jax.lax.scan(mutate, (0, new_edge_id), pop, neat_config.pop_size)
+
+    return pop
+
+
+def ask_fn(neat_config: NEATConfig):
+    """Generate a new population."""
+
+    # For now create an empty genome.
+    genome = create_empty_genome_fn(neat_config.config)
+    # Repeat the genome for the population size.
+    return jax.tree.map(lambda x: jnp.tile(x, (neat_config.pop_size, 1)), genome)
+
+
+def get_best_params_fn(fitness: jax.typing.ArrayLike, pops: GenomePopulation) -> Genome:
+    maxi = jax.lax.argmax(fitness, 0, jnp.int32)
+    best_params = jax.tree.map(lambda leaf: leaf[maxi], pops)
+    # Calculate next generation.
+
+    return best_params
+
 
 class NEAT(NEAlgorithm):
-    def __init__(self, config: NEATConfig):
+
+    def __init__(self, config: NEATConfig, key: jax.Array = jax.random.key(0)):
         self.pop_size = config.pop_size
         self._config = config
 
-        self._ask = jax.jit(ask_fn, static_argnums=(0))
+        self._pops = ask_fn(config)
 
-        self._tell = jax.jit(tell_fn)
+        self._get_best_params = jax.jit(get_best_params_fn)
+        self._generate_new_population = jax.jit(
+            generate_new_population_fn, static_argnums=(0)
+        )
+        self._key = key
 
     def ask(self):
-        self._pops = self._ask(self._config)
         return self._pops
 
     def tell(self, fitness: jax.typing.ArrayLike):
         # Select the best parameters.
-        self._best_params = self._tell(fitness, self._pops)
+        self._best_params = self._get_best_params(fitness, self._pops)
+        self._key, key = jax.random.split(self._key)
+        self._pops = self._generate_new_population(
+            self._config, fitness, self._pops, key
+        )
+        jax.debug.print(
+            """\
+            node_counts: {}
+            edge_counts: {}
+            """,
+            jnp.count_nonzero(self._pops.node_ids > 0),
+            jnp.count_nonzero(self._pops.conn_ids > 0),
+        )
 
     @property
     def best_params(self):
@@ -673,40 +753,8 @@ class NEAT(NEAlgorithm):
 #     np.testing.assert_allclose(output, jnp.array([[0.880797]]), atol=1e-5)
 
 
-def test2():
-    # SlimeVolley
-    task = SlimeVolley()
-
-    task_reset = jax.jit(task.reset)
-    t_state = task_reset(jax.random.split(jax.random.PRNGKey(seed=0), 3))
-
-    assert len(task.obs_shape) == 1
-    assert len(task.act_shape) == 1
-    config = Config(
-        input_dim=task.obs_shape[0],
-        output_dim=task.act_shape[0],
-        max_nodes=100,
-        max_edges=1000,
-        max_depth=10,
-    )
-    neat_config = NEATConfig(config, 3)
-    print(neat_config)
-    neat = NEAT(neat_config)
-    pops = neat.ask()
-    print(pops)
-
-    policy = NEATPolicy(config)
-    p_state = policy.reset(t_state)
-    get_actions = jax.jit(policy.get_actions)
-    output, p_state = get_actions(t_state, pops, p_state)
-
-    print("-------------------")
-    print(output.block_until_ready())
-    print("-------------------")
-
-
 log_dir = "./log/slimevolley"
-logger = util.create_logger(name="SlimeVolley", log_dir=log_dir, debug=True)
+logger = util.create_logger(name="SlimeVolley", log_dir=log_dir, debug=False)
 
 
 def test3():
@@ -718,11 +766,11 @@ def test3():
     config = Config(
         input_dim=task.obs_shape[0],
         output_dim=task.act_shape[0],
-        max_nodes=100,
-        max_edges=1000,
+        max_nodes=50,
+        max_edges=200,
         max_depth=10,
     )
-    neat_config = NEATConfig(config, 100)
+    neat_config = NEATConfig(config, pop_size=1000)
     policy = NEATPolicy(config)
     solver = NEAT(neat_config)
 
@@ -735,11 +783,11 @@ def test3():
         solver=solver,
         train_task=train_task,
         test_task=test_task,
-        max_iter=10,
-        log_interval=3,
-        test_interval=2,
-        n_repeats=3,
-        n_evaluations=4,
+        max_iter=100,
+        log_interval=1,
+        test_interval=10,
+        n_repeats=1,
+        n_evaluations=1,
         seed=42,
         log_dir=log_dir,
         logger=logger,
@@ -754,6 +802,8 @@ def test3():
     action_fn = jax.jit(policy.get_actions)
     best_params = jax.tree.map(lambda l: l[None, :], trainer.solver.best_params)
     key = jax.random.PRNGKey(0)[None, :]
+    print(genome_to_mermaid(trainer.solver.best_params, config, show_disabled=True))
+    print(best_params)
 
     task_state = task_reset_fn(key)
     policy_state = policy_reset_fn(task_state)
@@ -772,5 +822,4 @@ def test3():
 
 if __name__ == "__main__":
     # test2()
-    # test3()
-    pass
+    test3()
