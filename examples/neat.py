@@ -18,7 +18,20 @@ from evojax.trainer import Trainer
 
 
 # Data classes for the NEAT algorithm.
-@jax.tree_util.register_dataclass
+@partial(
+    jax.tree_util.register_dataclass,
+    # This is required to run on colab
+    data_fields=[
+        "node_ids",
+        "node_activation",
+        "conn_ids",
+        "conn_in",
+        "conn_out",
+        "conn_weights",
+        "conn_enabled",
+    ],
+    meta_fields=[],
+)
 @dataclass
 class Genome:
     """Stores node and connection info in JAX arrays."""
@@ -693,9 +706,8 @@ class NEAT(NEAlgorithm):
 
     def tell(self, fitness: jax.typing.ArrayLike):
         # Select the best parameters.
-        self._best_params = self._convert_to_array(
-            self._get_best_params(fitness, self._pops)
-        )
+        self._best_genome = self._get_best_params(fitness, self._pops)
+        self._best_params = self._convert_to_array(self._best_genome)
 
         # Generate a new population.
         self._key, key = jax.random.split(self._key)
@@ -719,12 +731,16 @@ class NEAT(NEAlgorithm):
     def best_params(self, params: jax.typing.ArrayLike):
         self._best_params = jnp.array(params)
 
+    @property
+    def best_genome(self) -> Genome:
+        return self._best_genome
+
 
 ##############################################################
 # Example usage.
 ##############################################################
 
-log_dir = f"./log/slimevolley_{datetime.now().strftime("%Y%m%d-%H%M%S")}"
+log_dir = "./log/slimevolley_" + datetime.now().strftime("%Y%m%d-%H%M%S")
 logger = util.create_logger(name="SlimeVolley", log_dir=log_dir, debug=False)
 
 
@@ -741,7 +757,7 @@ def test3():
         max_edges=200,
         max_depth=10,
     )
-    neat_config = NEATConfig(config, pop_size=100)
+    neat_config = NEATConfig(config, pop_size=300)
     policy = NEATPolicy(config)
     solver = NEAT(neat_config)
 
@@ -754,7 +770,7 @@ def test3():
         solver=solver,
         train_task=train_task,
         test_task=test_task,
-        max_iter=300,
+        max_iter=30,
         log_interval=1,
         test_interval=10,
         n_repeats=1,
@@ -773,7 +789,7 @@ def test3():
     action_fn = jax.jit(policy.get_actions)
     best_params = jax.tree.map(lambda l: l[None, :], trainer.solver.best_params)
     key = jax.random.PRNGKey(0)[None, :]
-    print(genome_to_mermaid(trainer.solver.best_params, config, show_disabled=True))
+    print(genome_to_mermaid(solver.best_genome, config, show_disabled=True))
     print(best_params)
 
     task_state = task_reset_fn(key)
