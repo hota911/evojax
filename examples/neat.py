@@ -34,6 +34,9 @@ class Genome:
     conn_weights: jax.Array  # shape [num_connections]
     conn_enabled: jax.Array  # shape [num_connections]
 
+# Type alias for the genome population.
+# To make it easier to understand the genome is only a single genome or a population of genomes.
+GenomePopulation = Genome
 
 @dataclass(frozen=True)
 class Config:
@@ -200,9 +203,6 @@ def get_params_format_fn(config: Config):
     print(params_sizes)
 
     def params_format_fn(params: jnp.ndarray) -> Genome:
-        # We use loop here.
-        # TODO: Check the performance of this function (e.g. jax.lax.map)
-        print(params.shape)
         parts = jnp.split(params, params_sizes)
         leaves = [jnp.asarray(p, dtype=d) for p, d in zip(parts, info)]
 
@@ -211,9 +211,9 @@ def get_params_format_fn(config: Config):
     return params_sizes[-1], params_format_fn
 
 
-def convert_to_array_fn(genome: Genome):
+def convert_to_array_fn(genome: GenomePopulation | Genome) -> jax.Array:
     """Convert the genome as a flat array."""
-    return jnp.concatenate(jax.tree.leaves(genome), dtype=jnp.float32)
+    return jnp.concatenate(jax.tree.leaves(genome), dtype=jnp.float32, axis=-1)
 
 
 ##############################################################
@@ -291,7 +291,7 @@ class NEATPolicy(PolicyNetwork):
         self, t_states: TaskState, params: jax.Array, p_states: PolicyState
     ) -> tuple[jax.Array, PolicyState]:
         params = self._format_params(params)
-        return self._forward_with_config_fn(t_states, params), p_states
+        return self._forward_with_config_fn(t_states.obs, params), p_states
 
 
 ##############################################################
@@ -612,11 +612,6 @@ def mutate_genome(
     return (genome, new_edge_id)
 
 
-# Type alias for the genome population.
-# To make it easier to understand the genome is only a single genome or a population of genomes.
-GenomePopulation = Genome
-
-
 def generate_new_population_fn(
     neat_config: NEATConfig,
     fitness: jax.typing.ArrayLike,
@@ -655,7 +650,7 @@ def generate_new_population_fn(
     return pop
 
 
-def ask_fn(neat_config: NEATConfig) -> jax.Array:
+def ask_fn(neat_config: NEATConfig) -> GenomePopulation:
     """Generate a new population.
 
     Returns:
@@ -664,12 +659,9 @@ def ask_fn(neat_config: NEATConfig) -> jax.Array:
 
     # For now create an empty genome.
     genome = create_empty_genome_fn(neat_config.config)
-    convert_to_array = jax.jit(jax.vmap(convert_to_array_fn))
 
     # Repeat the genome for the population size.
-    return convert_to_array(
-        jax.tree.map(lambda x: jnp.tile(x, (neat_config.pop_size, 1)), genome)
-    )
+    return jax.tree.map(lambda x: jnp.tile(x, (neat_config.pop_size, 1)), genome)
 
 
 def get_best_params_fn(fitness: jax.typing.ArrayLike, pops: GenomePopulation) -> Genome:
@@ -688,6 +680,8 @@ class NEAT(NEAlgorithm):
 
         self._pops = ask_fn(config)
 
+        self._convert_to_array = jax.jit(convert_to_array_fn)
+
         self._get_best_params = jax.jit(get_best_params_fn)
         self._generate_new_population = jax.jit(
             generate_new_population_fn, static_argnums=(0)
@@ -695,11 +689,15 @@ class NEAT(NEAlgorithm):
         self._key = key
 
     def ask(self):
-        return self._pops
+        return self._convert_to_array(self._pops)
 
     def tell(self, fitness: jax.typing.ArrayLike):
         # Select the best parameters.
-        self._best_params = self._get_best_params(fitness, self._pops)
+        self._best_params = self._convert_to_array(
+            self._get_best_params(fitness, self._pops)
+        )
+
+        # Generate a new population.
         self._key, key = jax.random.split(self._key)
         self._pops = self._generate_new_population(
             self._config, fitness, self._pops, key
@@ -714,7 +712,7 @@ class NEAT(NEAlgorithm):
         )
 
     @property
-    def best_params(self):
+    def best_params(self) -> jax.Array:
         return self._best_params
 
     @best_params.setter
@@ -725,53 +723,6 @@ class NEAT(NEAlgorithm):
 ##############################################################
 # Example usage.
 ##############################################################
-
-
-# def test1():
-#     config = Config(input_dim=2, output_dim=1, max_nodes=10, max_edges=20, max_depth=10)
-
-#     # 0 1
-#     # | |
-#     # 4 3
-#     #  \|
-#     #   2
-#     node_ids = jnp.array([0, 1, 2, 3, 4])
-#     node_activation = jnp.array([0, 0, 2, 0, 0])
-#     conn_ids = jnp.array([0, 1, 2, 3])
-#     conn_in = jnp.array([0, 1, 4, 3])
-#     conn_out = jnp.array([4, 3, 2, 2])
-#     conn_weights = jnp.array([1.0, 1.0, 1.0, 1.0])
-#     conn_enabled = jnp.array([True, True, True, True])
-#     genome = create_genome(
-#         config,
-#         node_ids,
-#         node_activation,
-#         conn_ids,
-#         conn_in,
-#         conn_out,
-#         conn_weights,
-#         conn_enabled,
-#     )
-#     genome = jax.tree.map(lambda x: jnp.array([x]), genome)
-
-#     x = jnp.stack([jnp.array([1, 1])])
-#     print(forward(config, genome, x))
-
-#     # SlimeVolley
-#     task = SlimeVolley()
-
-#     task_reset = jax.jit(task.reset)
-#     t_state = task_reset(jax.random.PRNGKey(seed=0)[None, :])
-
-    policy = NEATPolicy(config)
-    p_state = policy.reset(t_state)
-    get_actions = jax.jit(jax.vmap(policy.get_actions))
-    output, p_state = get_actions(x, genome, p_state)
-    output.block_until_ready()
-
-#     assert output.shape == (1, 1)
-#     np.testing.assert_allclose(output, jnp.array([[0.880797]]), atol=1e-5)
-
 
 log_dir = f"./log/slimevolley_{datetime.now().strftime("%Y%m%d-%H%M%S")}"
 logger = util.create_logger(name="SlimeVolley", log_dir=log_dir, debug=False)
