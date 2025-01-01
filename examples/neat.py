@@ -143,8 +143,8 @@ def create_empty_genome_fn(config: Config) -> Genome:
         jnp.arange(config.input_dim, config.input_dim + config.output_dim),
         config.input_dim,
     )
-    conn_weights = jnp.ones(conns)
-    conn_enabled = jnp.zeros(conns, dtype=bool)
+    conn_weights = jnp.zeros(conns)
+    conn_enabled = jnp.ones(conns, dtype=bool)
 
     return create_genome(
         config,
@@ -425,7 +425,10 @@ def mutate_add_node(
     config: Config, genome: Genome, key: jax.Array, next_edge_id: jax.Array
 ) -> tuple[Genome, jax.Array]:
     """Add nodes to the genome. This function is not jit-compiled."""
+    valid = jnp.array(True)
+
     conn_idx = pick_one(key, genome.conn_enabled)
+    valid = jnp.logical_and(valid, conn_idx >= 0)
 
     # Get the selected connection values
     in_node = genome.conn_in[conn_idx]
@@ -434,6 +437,7 @@ def mutate_add_node(
 
     # Add a new node
     new_node_id = genome.node_ids.max() + 1
+    valid = jnp.logical_and(valid, new_node_id < config.max_nodes)
 
     node_ids = genome.node_ids.at[new_node_id].set(new_node_id)
     node_activation = genome.node_activation.at[new_node_id].set(0)
@@ -455,7 +459,7 @@ def mutate_add_node(
 
     return (
         select(
-            new_node_id < config.max_nodes,
+            valid,
             Genome(
                 node_ids=node_ids,
                 node_activation=node_activation,
@@ -467,7 +471,7 @@ def mutate_add_node(
             ),
             genome,
         ),
-        next_edge_id + 2,
+        jnp.where(valid, next_edge_id + 2, next_edge_id),
     )
 
 
@@ -680,9 +684,6 @@ def calculate_distance(
     """Calculate the distance between two genomes."""
     common_idx = get_common_idx(genome1.conn_ids, genome2.conn_ids)
 
-    jax.debug.print(
-        "abs: {}", jnp.abs(genome1.conn_weights[common_idx] - genome2.conn_weights)
-    )
     diff_weight = jnp.mean(
         jnp.abs(genome1.conn_weights[common_idx] - genome2.conn_weights),
         where=common_idx >= 0,
@@ -695,10 +696,6 @@ def calculate_distance(
 
     disjoint_rate = (num_conn - 2 * num_common) / num_conn
 
-    jax.debug.print("common_idx: {}", common_idx)
-    jax.debug.print("diff_weight: {}", diff_weight)
-    jax.debug.print("disjoint_rate: {}", disjoint_rate)
-
     return (
         neat_config.coefficient_common_conn_weight * diff_weight
         + neat_config.coefficient_disjoint_conn * disjoint_rate
@@ -708,10 +705,33 @@ def calculate_distance(
 def calculate_species(
     neat_config: NEATConfig,
     genomes: GenomePopulation,
+    key: jax.Array,
 ) -> jax.Array:
     """Calculate the species of the genomes."""
-    # Calculate the distance matrix.
-    return jnp.zeros((neat_config.pop_size,), dtype=jnp.int32)
+
+    one = jax.random.randint(key, (), 0, neat_config.pop_size)
+    calculate_distance_vmapped = jax.vmap(calculate_distance, in_axes=(None, 0, None))
+
+    idx = jnp.array([one])
+    distance: None | jax.Array = None
+
+    for i in range(neat_config.num_species):
+        selected = jax.tree.map(lambda x: x[idx[-1]], genomes)
+        new_distance = jnp.array(
+            [calculate_distance_vmapped(neat_config, genomes, selected)]
+        )
+        distance = (
+            new_distance
+            if distance is None
+            else jnp.append(distance, new_distance, axis=0)
+        )
+        jax.debug.print("distance: {}", distance)
+        if i == neat_config.num_species - 1:
+            break
+        furthest = jnp.argmax(jnp.prod(distance, axis=0))
+        idx = jnp.append(idx, furthest)
+
+    return jnp.argmin(distance, axis=0)
 
 
 def generate_new_population_fn(
@@ -898,4 +918,5 @@ def test3():
 
 if __name__ == "__main__":
     # test2()
-    test3()
+    # test3()
+    pass
