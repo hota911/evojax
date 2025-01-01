@@ -13,9 +13,31 @@ from evojax.task.base import TaskState
 
 import jax.numpy as jnp
 
-from evojax.task.slimevolley import SlimeVolley
+from evojax.task.slimevolley import Game, SlimeVolley, State
 from evojax.trainer import Trainer
 
+from PIL import Image
+
+
+##############################################################
+# Patch the SlimeVolley class to add the render method.
+##############################################################
+
+
+def render(state: State, task_id: int = 0) -> Image:
+    """Render a specified task."""
+    task_game_state = jax.tree.map(lambda x: x[task_id], state.game_state)
+    game = Game(task_game_state)
+    canvas = game.display()
+    img = Image.fromarray(canvas)
+    return img
+
+
+SlimeVolley.render = render  # type: ignore
+
+##############################################################
+# Data classes for the NEAT algorithm.
+##############################################################
 
 # Data classes for the NEAT algorithm.
 @partial(
@@ -339,6 +361,13 @@ class NEATConfig:
     prob_update_conn_weights: float = 0.1
     prob_update_conn_enabled: float = 0.1
 
+    # ------------------------------
+    # Crossover parameters.
+    # ------------------------------
+    coefficient_common_conn_weight: float = 0.5
+    coefficient_disjoint_conn: float = 1.0
+    num_species: int = 5
+
 @jax.jit
 def pick_one(key: jax.Array, mask: jax.Array) -> int:
     """Pick up one index where the mask is true.
@@ -623,6 +652,66 @@ def mutate_genome(
     genome = mutate_attributes(neat_config, genome, key_mutate)
 
     return (genome, new_edge_id)
+
+# Species
+
+int32_max = np.iinfo(np.int32).max
+
+
+def get_common_idx(array1: jax.Array, array2: jax.Array) -> jax.Array:
+    """Get the index of the common elements between two arrays.
+
+    Returns: for each i, the index of array1 where array2[i] is found, or -1 if not found.
+
+    ```python
+    ret = []
+    for v1 in array2:
+        ret.append(array1.find(v1))
+    return ret
+    """
+    array1_sorted = jnp.where(array1 >= 0, array1, int32_max)
+    possible_idx = jnp.searchsorted(array1_sorted, array2)
+    return jnp.where(array1[possible_idx] == array2, possible_idx, -1)
+
+
+def calculate_distance(
+    neat_config: NEATConfig, genome1: Genome, genome2: Genome
+) -> jax.Array:
+    """Calculate the distance between two genomes."""
+    common_idx = get_common_idx(genome1.conn_ids, genome2.conn_ids)
+
+    jax.debug.print(
+        "abs: {}", jnp.abs(genome1.conn_weights[common_idx] - genome2.conn_weights)
+    )
+    diff_weight = jnp.mean(
+        jnp.abs(genome1.conn_weights[common_idx] - genome2.conn_weights),
+        where=common_idx >= 0,
+    )
+
+    num_common = jnp.count_nonzero(common_idx >= 0)
+    num_conn = jnp.count_nonzero(genome1.conn_ids >= 0) + jnp.count_nonzero(
+        genome2.conn_ids >= 0
+    )
+
+    disjoint_rate = (num_conn - 2 * num_common) / num_conn
+
+    jax.debug.print("common_idx: {}", common_idx)
+    jax.debug.print("diff_weight: {}", diff_weight)
+    jax.debug.print("disjoint_rate: {}", disjoint_rate)
+
+    return (
+        neat_config.coefficient_common_conn_weight * diff_weight
+        + neat_config.coefficient_disjoint_conn * disjoint_rate
+    )
+
+
+def calculate_species(
+    neat_config: NEATConfig,
+    genomes: GenomePopulation,
+) -> jax.Array:
+    """Calculate the species of the genomes."""
+    # Calculate the distance matrix.
+    return jnp.zeros((neat_config.pop_size,), dtype=jnp.int32)
 
 
 def generate_new_population_fn(
