@@ -73,6 +73,12 @@ class Genome:
 # To make it easier to understand the genome is only a single genome or a population of genomes.
 GenomePopulation = Genome
 
+
+def pickup_genome(pop: GenomePopulation, idx: jax.Array) -> Genome:
+    """Pick up the genome from the population."""
+    return jax.tree_map(lambda x: x[idx], pop)
+
+
 @dataclass(frozen=True)
 class Config:
     """Stores static info for the NEAT algorithm."""
@@ -725,13 +731,84 @@ def calculate_species(
             if distance is None
             else jnp.append(distance, new_distance, axis=0)
         )
-        jax.debug.print("distance: {}", distance)
         if i == neat_config.num_species - 1:
             break
         furthest = jnp.argmax(jnp.prod(distance, axis=0))
         idx = jnp.append(idx, furthest)
 
     return jnp.argmin(distance, axis=0)
+
+
+def crossover(
+    neat_config: NEATConfig,
+    key: jax.Array,
+    fitness: jax.Array,
+    pop: GenomePopulation,
+    idx: jax.Array,
+) -> Genome:
+    """Generate a new genome."""
+    (p1_idx, p2_idx) = idx[
+        jax.random.randint(key, [2], minval=0, maxval=neat_config.pop_size)
+    ]
+
+    # Use p1 as the better genome.
+    (p1_idx, p2_idx) = jnp.where(
+        fitness[p1_idx] > fitness[p2_idx],
+        jnp.array([p1_idx, p2_idx]),
+        jnp.array([p2_idx, p1_idx]),
+    )
+    genome1 = pickup_genome(pop, p1_idx)
+    genome2 = pickup_genome(pop, p2_idx)
+
+    common_idx = get_common_idx(genome1.conn_ids, genome2.conn_ids)
+    random = jax.random.uniform(key, [neat_config.config.max_edges])
+
+    def merge_conn(conn1: jax.Array, conn2: jax.Array) -> jax.Array:
+        return jnp.where(jnp.logical_or(common_idx < 0, random < 0.5), conn1, conn2)
+
+    return Genome(
+        node_ids=genome1.node_ids,
+        node_activation=genome1.node_activation,
+        conn_ids=merge_conn(genome1.conn_ids, genome2.conn_ids),
+        conn_in=merge_conn(genome1.conn_in, genome2.conn_in),
+        conn_out=merge_conn(genome1.conn_out, genome2.conn_out),
+        conn_weights=merge_conn(genome1.conn_weights, genome2.conn_weights),
+        conn_enabled=merge_conn(genome1.conn_enabled, genome2.conn_enabled),
+    )
+
+
+def generate_new_population_for_species(
+    neat_config: NEATConfig,
+    fitness: jax.typing.ArrayLike,
+    pop: GenomePopulation,
+    key: jax.Array,
+    pop_sizes: jax.Array,
+    species: jax.Array,
+    species_index: jax.Array,
+) -> GenomePopulation:
+    """Generate a new population."""
+    # Sort the genomes based on the fitness and species.
+    sorted_idx = jnp.argsort(
+        jnp.where(species == species_index, fitness, 0), descending=True
+    )
+
+    parent_size = jnp.ceil(
+        pop_sizes[species_index] * neat_config.rate_keep_best
+    ).astype(jnp.int32)
+    # Limit the target size to the species size.
+    species_size = jnp.count_nonzero(species == species_index)
+    parent_size = jnp.minimum(parent_size, species_size)
+
+    # Repeat the top genomes.
+    idx = jax.lax.map(
+        lambda i: sorted_idx[i % parent_size],
+        jnp.arange(neat_config.pop_size),
+    )
+
+    def crossover_fn(key):
+        return crossover(neat_config, key, fitness, pop, idx)
+
+    return jax.vmap(crossover_fn)(jax.random.split(key, neat_config.pop_size))
 
 
 def generate_new_population_fn(
@@ -741,30 +818,76 @@ def generate_new_population_fn(
     key: jax.Array,
 ) -> GenomePopulation:
     """Generate a new population."""
-    # Calculate the best genomes.
-    k = math.ceil(neat_config.pop_size * neat_config.rate_keep_best)
-    _, top_idx = jax.lax.top_k(fitness, k)
-    top_genomes = jax.tree_map(lambda x: x[top_idx], pop)
+    key, key_calc_species = jax.random.split(key, 2)
+    species = calculate_species(neat_config, pop, key_calc_species)
 
-    # Repeat the top genomes.
-    n_repeats = (neat_config.pop_size + k - 1) // k
-    pop = jax.tree_map(
-        lambda x: jnp.repeat(
-            x, n_repeats, axis=0, total_repeat_length=neat_config.pop_size
+    # Competition Mitigation
+    # Calculate pop_size per species based on the mean score.
+
+    # Make fitness positive.
+    min_score = jnp.min(fitness)
+    fitness = fitness - min_score + 0.01
+
+    mean_score_per_species = jax.lax.map(
+        lambda idx: jnp.nanmean(jnp.where(species == idx, fitness, jnp.nan)),
+        jnp.arange(neat_config.num_species),
+    )
+    # normalize the score.
+    mean_score_per_species = mean_score_per_species / jnp.sum(mean_score_per_species)
+    pop_sizes_per_species = jnp.ceil(
+        neat_config.pop_size * mean_score_per_species
+    ).astype(jnp.int32)
+    jax.debug.print(
+        "size: {}, pop_size: {}",
+        jax.lax.map(
+            lambda i: jnp.sum(species == i),
+            jnp.arange(neat_config.num_species),
         ),
-        top_genomes,
+        pop_sizes_per_species,
     )
 
+    # calculate the new population for each species.
+    def generate_new_population_for_species_fn(species_index, key):
+        return generate_new_population_for_species(
+            neat_config,
+            fitness,
+            pop,
+            key,
+            pop_sizes_per_species,
+            species,
+            species_index,
+        )
+
+    key, key_for_crossover = jax.random.split(key, 2)
+    pops_per_species = jax.vmap(generate_new_population_for_species_fn)(
+        jnp.arange(neat_config.num_species),
+        jax.random.split(key_for_crossover, neat_config.num_species),
+    )
+
+    # Calculate the population.
+    cumsum_pop_sizes_per_species = jnp.cumsum(pop_sizes_per_species)
+
+    # Get ith genome from the corresponding species.
+    def ith_genome(i):
+        species_index = jnp.argmax(i < cumsum_pop_sizes_per_species)
+        return pickup_genome(pickup_genome(pops_per_species, species_index), i)
+
+    pop = jax.lax.map(ith_genome, jnp.arange(neat_config.pop_size))
+
+    ## Mutate the genes.
     new_edge_id = jnp.max(pop.conn_ids) + 1
 
-    keys = jax.random.split(key, neat_config.pop_size)
+    key, key_for_mutate = jax.random.split(key, 2)
+    keys_for_mutate = jax.random.split(key_for_mutate, neat_config.pop_size)
 
     # Mutate the genes. To assign the edge id sequentially, we use scan.
     def mutate(
         carry: tuple[int, jax.Array], genome: Genome
     ) -> tuple[tuple[int, jax.Array], Genome]:
         (i, new_edge_id) = carry
-        (genome, new_edge_id) = mutate_genome(neat_config, genome, keys[i], new_edge_id)
+        (genome, new_edge_id) = mutate_genome(
+            neat_config, genome, keys_for_mutate[i], new_edge_id
+        )
         return ((i + 1, new_edge_id), genome)
 
     _, pop = jax.lax.scan(mutate, (0, new_edge_id), pop, neat_config.pop_size)
@@ -823,15 +946,6 @@ class NEAT(NEAlgorithm):
         self._pops = self._generate_new_population(
             self._config, fitness, self._pops, key
         )
-        jax.debug.print(
-            """\
-            node_counts: {}
-            edge_counts: {}
-            """,
-            jnp.count_nonzero(self._pops.node_ids > 0),
-            jnp.count_nonzero(self._pops.conn_ids > 0),
-        )
-
     @property
     def best_params(self) -> jax.Array:
         return self._best_params
